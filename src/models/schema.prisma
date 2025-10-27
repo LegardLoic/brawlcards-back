@@ -1,0 +1,313 @@
+// --------------------------------------
+// Prisma schema – BrawlCards: Origins
+// --------------------------------------
+
+generator client {
+  provider = "prisma-client-js"
+  // garde ton output custom si tu veux générer le client dans src/
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// --------------------
+// Enums
+// --------------------
+enum GameStatus {
+  WAITING
+  IN_PROGRESS
+  FINISHED
+  CANCELED
+}
+
+enum Phase {
+  SHOP
+  COMBAT
+}
+
+enum Zone {
+  SHOP
+  HAND
+  BOARD
+  GRAVEYARD
+  DECK
+}
+
+enum AbilityTrigger {
+  ON_BUY
+  ON_SELL
+  ON_SUMMON
+  ON_START_COMBAT
+  ON_DEATH
+  ON_DAMAGE
+  ON_ATTACK
+  ON_PLAY
+  PASSIVE
+}
+
+enum ModifierScope {
+  SELF
+  BOARD_ALLY
+  BOARD_ENEMY
+  GLOBAL
+}
+
+// --------------------
+// Utilisateurs & Parties
+// --------------------
+model User {
+  id           Int      @id @default(autoincrement())
+  email        String   @unique
+  pseudo       String   @unique
+  passwordHash String
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  players Player[]
+}
+
+model Game {
+  id        Int        @id @default(autoincrement())
+  status    GameStatus @default(WAITING)
+  turn      Int        @default(1)
+  phase     Phase      @default(SHOP)
+  rngSeed   String
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+
+  players Player[]
+  events  GameEvent[]
+  actions Action[]
+
+  @@index([status])
+  @@index([phase])
+}
+
+model Player {
+  id          Int      @id @default(autoincrement())
+  userId      Int
+  gameId      Int
+  hp          Int      @default(40)
+  gold        Int      @default(0)
+  tavernLevel Int      @default(1)
+  order       Int      @default(0)
+  ready       Boolean  @default(false)
+  socketId    String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  game Game @relation(fields: [gameId], references: [id], onDelete: Cascade)
+
+  cards     PlayerCard[]
+  modifiers Modifier[]   @relation("PlayerModifiers")
+  events    GameEvent[]  @relation("EventActor")
+  actions   Action[]
+
+  @@unique([gameId, userId])
+  @@index([gameId])
+  @@index([userId])
+}
+
+// --------------------
+// Cartes (statique)
+// --------------------
+model CardFamily {
+  id          Int     @id @default(autoincrement())
+  name        String  @unique
+  description String?
+
+  cards Card[]
+}
+
+model Card {
+  id          Int     @id @default(autoincrement())
+  familyId    Int
+  name        String
+  description String?
+  atkBase     Int     @default(0)
+  hpBase      Int     @default(1)
+  tavernTier  Int     @default(1)
+  rarity      String? // optionnel si tu veux gérer rareté
+  img         String?
+
+  family    CardFamily    @relation(fields: [familyId], references: [id], onDelete: Restrict)
+  keywords  CardKeyword[]
+  abilities CardAbility[]
+  instances PlayerCard[]
+
+  @@index([familyId])
+  @@index([tavernTier])
+}
+
+model Keyword {
+  id    Int     @id @default(autoincrement())
+  code  String  @unique // ex: TAUNT, SHIELD, WINDFURY
+  label String?
+
+  cards CardKeyword[]
+}
+
+// table de liaison N-N
+model CardKeyword {
+  cardId    Int
+  keywordId Int
+
+  card    Card    @relation(fields: [cardId], references: [id], onDelete: Cascade)
+  keyword Keyword @relation(fields: [keywordId], references: [id], onDelete: Cascade)
+
+  @@id([cardId, keywordId])
+}
+
+// Décrit un "pouvoir" générique (statique)
+model Ability {
+  id         Int            @id @default(autoincrement())
+  name       String
+  trigger    AbilityTrigger
+  targetSpec Json?
+  effectSpec Json?
+
+  cards         CardAbility[]
+  triggerStates TriggerState[] // back-relation vers TriggerState.ability
+}
+
+// Liaison d’une ability à une carte avec paramétrage
+model CardAbility {
+  id        Int   @id @default(autoincrement())
+  cardId    Int
+  abilityId Int
+  params    Json? // surcharge éventuelle (valeurs, seuils, etc.)
+
+  card    Card    @relation(fields: [cardId], references: [id], onDelete: Cascade)
+  ability Ability @relation(fields: [abilityId], references: [id], onDelete: Cascade)
+
+  @@unique([cardId, abilityId])
+  @@index([cardId])
+  @@index([abilityId])
+}
+
+// --------------------
+// État de partie (dynamique)
+// --------------------
+model PlayerCard {
+  id       Int  @id @default(autoincrement())
+  playerId Int
+  cardId   Int
+  zone     Zone
+  position Int  @default(0)
+
+  // état courant (recalculable à partir des modifiers, mais stocké pour perfs + logs)
+  atk Int @default(0)
+  hp  Int @default(1)
+
+  // flags/mots-clés dynamiques
+  isGolden    Boolean @default(false)
+  exhausted   Boolean @default(false)
+  attacksLeft Int     @default(1)
+
+  shield    Boolean @default(false)
+  stealth   Boolean @default(false)
+  taunt     Boolean @default(false)
+  poisonous Boolean @default(false)
+  lifesteal Boolean @default(false)
+  reborn    Boolean @default(false)
+
+  // trace d'origine (invocation, fusion…)
+  sourcePlayerCardId Int?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  player  Player       @relation(fields: [playerId], references: [id], onDelete: Cascade)
+  card    Card         @relation(fields: [cardId], references: [id], onDelete: Restrict)
+  source  PlayerCard?  @relation("SpawnSource", fields: [sourcePlayerCardId], references: [id])
+  spawned PlayerCard[] @relation("SpawnSource")
+
+  modifiers           Modifier[]
+  triggerMem          TriggerState[]
+  modifiersFromSource Modifier[]     @relation("ModifierSource")
+
+  @@index([playerId, zone, position])
+  @@index([cardId])
+}
+
+model Modifier {
+  id           Int  @id @default(autoincrement())
+  // cible : soit une carte, soit tout un joueur (ex: auras/global)
+  playerCardId Int?
+  playerId     Int?
+
+  // source (carte qui applique l’effet)
+  sourcePlayerCardId Int?
+
+  type      String // ex: "BUFF", "AURA", "TEMPORARY", "SILENCE", ...
+  scope     ModifierScope @default(SELF)
+  stacks    Int           @default(1)
+  uniqueKey String? // pour éviter doublons non-cumulables
+  startTurn Int?
+  endTurn   Int?
+  data      Json // { addAtk:3, addHp:0, until:"END_OF_COMBAT" }
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  playerCard PlayerCard? @relation(fields: [playerCardId], references: [id], onDelete: Cascade)
+  player     Player?     @relation("PlayerModifiers", fields: [playerId], references: [id], onDelete: Cascade)
+  source     PlayerCard? @relation("ModifierSource", fields: [sourcePlayerCardId], references: [id])
+
+  @@index([playerCardId])
+  @@index([playerId])
+  @@index([uniqueKey])
+}
+
+model TriggerState {
+  id           Int  @id @default(autoincrement())
+  playerCardId Int
+  abilityId    Int
+  lastTurnUsed Int?
+  chargesLeft  Int?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  playerCard PlayerCard @relation(fields: [playerCardId], references: [id], onDelete: Cascade)
+  ability    Ability    @relation(fields: [abilityId], references: [id], onDelete: Cascade)
+
+  @@unique([playerCardId, abilityId])
+  @@index([abilityId])
+}
+
+// --------------------
+// Réseau / Journalisation
+// --------------------
+model GameEvent {
+  id            Int      @id @default(autoincrement())
+  gameId        Int
+  actorPlayerId Int? // FK optionnelle
+  type          String
+  payload       Json
+  createdAt     DateTime @default(now())
+
+  game  Game    @relation(fields: [gameId], references: [id], onDelete: Cascade)
+  actor Player? @relation("EventActor", fields: [actorPlayerId], references: [id]) // <- rendre optionnel
+
+  @@index([gameId, createdAt])
+  @@index([actorPlayerId])
+}
+
+model Action {
+  id        Int      @id @default(autoincrement())
+  gameId    Int
+  playerId  Int
+  type      String
+  payload   Json
+  createdAt DateTime @default(now())
+
+  game   Game   @relation(fields: [gameId], references: [id], onDelete: Cascade)
+  player Player @relation(fields: [playerId], references: [id], onDelete: Cascade)
+
+  @@index([gameId, createdAt])
+  @@index([playerId, createdAt])
+}
